@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Summarises an nginx/apache access log: top IPs, status counts, top paths.
+set -euo pipefail
+
+TOP=10
+SECTIONS="ips,status,paths,bytes"
+
+usage() {
+  cat <<'EOF'
+Usage: log-parser [-n TOP] [-o SECTIONS] [FILE...]
+
+Reads combined/common access-log lines from FILE(s) or stdin and prints a summary.
+
+  -n TOP       how many rows per top-list (default 10)
+  -o SECTIONS  comma-separated subset of: ips,status,paths,bytes (default all)
+  -h           this help
+
+Example:
+  log-parser -n 3 samples/access.log
+  cat samples/access.log | log-parser -o status
+EOF
+}
+
+while getopts ':n:o:h' opt; do
+  case "$opt" in
+    n) TOP="$OPTARG" ;;
+    o) SECTIONS="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    :) echo "log-parser: -$OPTARG needs a value" >&2; exit 2 ;;
+    *) echo "log-parser: unknown option -$OPTARG" >&2; usage >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+case "$TOP" in
+  '' | *[!0-9]*) echo "log-parser: -n expects a positive integer" >&2; exit 2 ;;
+  0) echo "log-parser: -n expects a positive integer" >&2; exit 2 ;;
+esac
+
+for f in "$@"; do
+  [ -r "$f" ] || { echo "log-parser: cannot read $f" >&2; exit 2; }
+done
+
+awk -v top="$TOP" -v sections=",${SECTIONS}," '
+function want(name) { return index(sections, "," name ",") > 0 }
+
+function head(title) { printf "\n== %s ==\n", title }
+
+function dump(arr, title,   key, n, i, j, k, v, keys, vals, tk, tv) {
+  head(title)
+  n = 0
+  for (key in arr) { n++; keys[n] = key; vals[n] = arr[key] }
+  for (i = 1; i < n; i++)
+    for (j = 1; j <= n - i; j++)
+      if (vals[j] < vals[j + 1] || (vals[j] == vals[j + 1] && keys[j] > keys[j + 1])) {
+        tv = vals[j]; vals[j] = vals[j + 1]; vals[j + 1] = tv
+        tk = keys[j]; keys[j] = keys[j + 1]; keys[j + 1] = tk
+      }
+  k = (n < top) ? n : top
+  for (i = 1; i <= k; i++) printf "%8d  %s\n", vals[i], keys[i]
+  if (k == 0) print "       0  (none)"
+}
+
+{
+  total++
+  line = $0
+  if (match(line, /"[A-Z]+ [^"]*"/) == 0) { malformed++; next }
+  request = substr(line, RSTART + 1, RLENGTH - 2)
+  tail = substr(line, RSTART + RLENGTH)
+  split(request, rq, " ")
+  split(tail, tl, " ")
+  status = tl[1]
+  size = tl[2]
+  if (status !~ /^[1-5][0-9][0-9]$/) { malformed++; next }
+  parsed++
+  ip[$1]++
+  code[status]++
+  class[substr(status, 1, 1) "xx"]++
+  path[rq[1] " " rq[2]]++
+  if (size ~ /^[0-9]+$/) bytes += size
+}
+
+END {
+  printf "lines=%d parsed=%d malformed=%d\n", total + 0, parsed + 0, malformed + 0
+  if (want("ips")) dump(ip, "Top " top " client IPs")
+  if (want("status")) { dump(code, "Status codes"); dump(class, "Status classes") }
+  if (want("paths")) dump(path, "Top " top " requests")
+  if (want("bytes")) { head("Transferred"); printf "%8d  bytes\n%8.2f  KiB\n", bytes + 0, (bytes + 0) / 1024 }
+}
+' "$@"
